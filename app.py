@@ -3,11 +3,31 @@ import fitz  # PyMuPDF
 from PIL import Image
 import io
 import os
+import re
 
-# FUERZA LA ACTUALIZACIÓN: Borra la memoria interna para leer el PDF nuevo de GitHub
+# FUERZA LA ACTUALIZACIÓN: Borra la memoria interna cada vez que se abre
 st.cache_data.clear() 
 
-st.set_page_config(page_title="Monitor PPA - Actualización", layout="wide")
+st.set_page_config(page_title="Monitor PPA - Automatizado", layout="wide")
+
+def extraer_datos_inteligente(doc):
+    """Busca los números clave dentro del texto del PDF para automatizar la App"""
+    texto_completo = ""
+    for pagina in doc:
+        texto_completo += pagina.get_text()
+    
+    # Buscamos patrones numéricos específicos en el texto
+    def buscar_numero(patron, texto):
+        match = re.search(patron, texto, re.IGNORECASE)
+        return match.group(1) if match else "N/D"
+
+    datos = {
+        "focos_totales": buscar_numero(r"(\d+)\s+Focos totales", texto_completo),
+        "casos_positivos": buscar_numero(r"(\d+)\s+Casos positivos", texto_completo),
+        "animales_negativos": buscar_numero(r"([\d.]+)\s+Animales negativos", texto_completo),
+        "fecha": buscar_numero(r"(\d+ de \w+ de 202\d)", texto_completo)
+    }
+    return datos
 
 def extraer_pagina(doc, num_pag, zoom=2.5):
     if doc and len(doc) > num_pag:
@@ -16,80 +36,44 @@ def extraer_pagina(doc, num_pag, zoom=2.5):
         return Image.open(io.BytesIO(pix.tobytes()))
     return None
 
-# Nombre del archivo único
 archivo = "Peste-Porcina-Africana-Situacion-Actual.pdf"
 
 if not os.path.exists(archivo):
-    st.error(f"⚠️ No se encuentra el archivo: {archivo}. Asegúrate de que el nombre en GitHub sea exacto.")
+    st.error(f"⚠️ No se encuentra '{archivo}' en GitHub.")
 else:
     doc = fitz.open(archivo)
+    datos = extraer_datos_inteligente(doc)
     
-    st.title("🐖 Informe de Situación PPA")
-    st.info("Última actualización detectada en el documento: 26 de marzo de 2026")
+    st.title("🐖 Informe Automático de Situación PPA")
+    st.info(f"📅 Datos extraídos del documento con fecha: {datos['fecha']}")
 
-    # --- BLOQUE 1: DATOS CLAVE (Extraídos del Resumen Ejecutivo) ---
-    st.header("1️⃣ Resumen de Focos y Casos")
-    col1, col2 = st.columns([1, 1])
+    # --- BLOQUE 1: DATOS DINÁMICOS ---
+    st.header("1️⃣ Resumen Ejecutivo (Datos Reales)")
+    c1, c2, c3 = st.columns(3)
     
-    with col1:
-        st.subheader("Última Semana")
-        # Datos según pág 2 y 7 del PDF
-        st.metric("Nuevos Focos", "1")
-        st.metric("Nuevos Positivos (Jabalíes)", "6")
-    
-    with col2:
-        st.subheader("Acumulado Total")
-        # Datos según pág 3 y 7 del PDF
-        st.metric("Focos Totales", "41")
-        st.metric("Jabalíes Positivos", "238")
-        st.metric("Cerdo Doméstico", "0", delta_color="normal")
+    with c1:
+        st.metric("Focos Totales", datos['focos_totales'])
+    with c2:
+        st.metric("Jabalíes Positivos", datos['casos_positivos'])
+    with c3:
+        st.metric("Animales Negativos", datos['animales_negativos'])
 
     st.divider()
 
-    # --- BLOQUE 2: MAPAS Y MUNICIPIOS ---
-    st.header("2️⃣ Localización y Municipios Afectados")
-    c_mapa, c_lista = st.columns([2, 1])
-    
-    with c_mapa:
-        # Página 4 contiene el mapa de municipios
-        img_mapa = extraer_pagina(doc, 3) 
-        if img_mapa:
-            st.image(img_mapa, caption="Mapa de Municipios en Zona Restringida")
-            
-    with c_lista:
-        st.write("**Municipios afectados (10):**")
-        # Lista extraída de la página 4 y 7
-        municipios = [
-            "Barcelona", "Cerdanyola del Vallès", "Molins de Rei", "Rubí", 
-            "Sabadell", "Sant Cugat del Vallès", "Sant Feliu de Llobregat", 
-            "Sant Just Desvern", "Sant Quirze del Vallès", "Terrassa"
-        ]
-        for m in municipios:
-            st.write(f"- {m}")
+    # --- BLOQUE 2: MAPAS ---
+    st.header("2️⃣ Mapas de Situación")
+    # Intentamos extraer la página 4 (donde suele estar el mapa principal)
+    img_mapa = extraer_pagina(doc, 3) 
+    if img_mapa:
+        st.image(img_mapa, caption="Distribución Geográfica de los Focos", use_container_width=True)
 
     st.divider()
 
-    # --- BLOQUE 3: BIOSEGURIDAD Y CONTENCIÓN ---
-    st.header("3️⃣ Medidas y Vallados")
-    # Página 6 contiene el mapa satelital de vallados y medidas
-    img_bio = extraer_pagina(doc, 5)
-    if img_bio:
-        st.image(img_bio, caption="Zonas de vallado y control de agentes rurales")
-    
-    st.warning("**Aviso:** La situación se mantiene contenida en fauna silvestre. Las 45 granjas de la zona permanecen libres de infección.")
-
-    st.divider()
-
-    # --- BLOQUE 4: IMPACTO ECONÓMICO (MERCOLLEIDA) ---
-    st.header("4️⃣ Evolución del Mercado y Precios")
-    # Página 8 contiene las gráficas y la tabla de Mercolleida
-    img_precios = extraer_pagina(doc, 7)
+    # --- BLOQUE 3: MERCADO (LONJA) ---
+    st.header("3️⃣ Evolución de Precios (Mercolleida)")
+    # La última página siempre contiene la tabla de precios
+    img_precios = extraer_pagina(doc, len(doc) - 1)
     if img_precios:
-        st.image(img_precios, caption="Gráficas de Cotización y Evolución (Fuente: Mercolleida)")
-    
-    with st.expander("Ver detalle de cotización Mercolleida (26/03/2026)"):
-        st.write("- **Cerdo Cebado:** +0,025 €/kg (Subida moderada)")
-        st.write("- **Lechón 20kg:** 65,00 € (Sin cambios)")
-        st.write("- **Cerdo Selecto:** 1,282 €/kg")
+        st.image(img_precios, caption="Últimas Cotizaciones Oficiales", use_container_width=True)
 
     doc.close()
