@@ -1,50 +1,64 @@
-# PPA España — Comité de Dirección | Nutreco / TechTeam
+# PPA España — Comité de Dirección (Nutreco / TechTeam)
 
-## Aplicación
-Panel Streamlit de PPA en Cataluña: lectura de notas oficiales MAPA (PDF), indicadores epidemiológicos, mapas, medidas, evolución de las últimas notas y mercado porcino (Mercolleida / 3tres3).
+**Versión 3.2 — 30 de octubre de 2026**
 
-### Archivo de arranque
-`main.py`
+Panel Streamlit que analiza notas PDF del MAPA sobre la peste porcina africana en Cataluña y muestra cifras epidemiológicas, mapas, medidas oficiales, evolución y referencias del mercado porcino.
 
-### Dependencias
-`requirements.txt`
+## Archivos para GitHub
 
-### Logos
-Incluir en la raíz del repositorio:
+Coloca en la **raíz de tu repositorio**:
+
+- `main.py`
+- `requirements.txt`
+- `README.md`
 - `Logo Nutreco.jpg`
 - `Logo TechTeam 2.jpg`
-- `Solapa rosa trasparente.png` (o `Solapa rosa.jpg`)
+- `Solapa rosa trasparente.png` (y opcionalmente `Solapa rosa.jpg`)
+- `Peste-Porcina-Africana-Situacion-Actual.pdf` *(opcional: ya aparece en tu repositorio; puede servir de respaldo si es una nota MAPA válida)*
 
-## Ejecución
+El archivo de entrada de Streamlit Community Cloud es `main.py`. Comprueba que la **rama** y el **repositorio** configurados en Streamlit coinciden con los de GitHub.
+
+## Despliegue
+
+1. Añade o sustituye los archivos anteriores en GitHub.
+2. En Streamlit Community Cloud, abre `Manage app` → `Settings` y comprueba repositorio, rama y `Main file path = main.py`.
+3. Desde `Manage app`, elige `Reboot app` si el cambio no se aplica.
+4. Debajo del encabezado debe aparecer **VERSIÓN 3.2 · 30/10/2026 · inicio seguro y recuperación local**.
+
+Para ejecutar localmente:
+
 ```bash
 pip install -r requirements.txt
 streamlit run main.py
 ```
 
-En Streamlit Community Cloud, elegir el repositorio, rama y **main.py**.
+## Recuperación de datos y errores SSL
 
-## Frecuencia
-Consulta automática cada **15 minutos mientras la página está abierta** y actualización manual con botón. La caché de las fuentes tiene TTL de 15 minutos; la actualización manual vacía esa caché.
+Si falla la conexión SSL al MAPA, la app no desactiva la verificación TLS. En su lugar:
 
-## Cuando la lectura falla
-Si la conexión o la extracción de PDF falla, el panel recupera la última lectura verificada guardada en `data_ppa/`, informa visiblemente del fallo y muestra la **fecha de la nota**, así como la **hora de la última lectura correcta**. Los valores que no pueden verificarse se muestran **N/D**, nunca con números inventados. Los PDFs recuperados quedan guardados para que puedan seguir viéndose y descargándose sin conexión.
+1. Recupera su última lectura verificada guardada, si existe.
+2. En un despliegue nuevo sin lectura anterior, intenta usar el PDF `Peste-Porcina-Africana-Situacion-Actual.pdf` que ya está en el repositorio. **Solo acepta el PDF si reconoce fecha, PPA, Cataluña y datos epidemiológicos.**
+3. Si tampoco puede validar ese documento, muestra un aviso y `N/D`, sin inventar cifras. Se puede cargar manualmente la última nota oficial desde la barra lateral.
+4. Indica la **fecha del documento** y advierte si se están mostrando datos conservados, que podrían estar desactualizados.
 
-### IMPORTANTE: conservación entre reinicios
-El sistema de archivos de Streamlit Community Cloud puede ser **efímero**. La app ofrece **Descargar copia de lectura verificada (ZIP)** en la barra lateral, y **Restaurar datos verificados** desde un ZIP que hayas guardado. Mantener un archivo externo de respaldo (o almacenamiento persistente) es necesario si quieres conservar la copia cuando Streamlit reinicie o sustituya el contenedor.
+La lectura se actualiza cada 15 minutos mientras la aplicación está abierta. Streamlit Community Cloud puede reiniciar el almacenamiento temporal: conviene descargar la copia de seguridad ZIP que ofrece la aplicación y guardarla fuera del servidor.
 
-Si el servidor nunca consiguió descargar ninguna nota, no dispone de cifras previas verificadas: aparecerá un aviso claro y los indicadores `N/D` hasta que la conexión se repare o se importe un ZIP de respaldo.
+## Correcciones incorporadas en v3.2
 
-## Certificados HTTPS y seguridad
-Nunca se usa `verify=False`. Si aparece `CERTIFICATE_VERIFY_FAILED`, hay que diagnosticar la cadena de certificados en el servidor donde corre Streamlit. Para una autoridad certificadora de confianza propia (por ejemplo, proxy de empresa), se puede instalar su **certificado CA raíz válido y autorizado** y configurar en el entorno:
+- Evita una excepción identificada cuando la app arranca sin datos y una URL PDF vale `None`.
+- Evita caídas por ausencia de los logos: en ese caso presenta cabeceras de texto.
+- Añade recuperación desde el PDF preexistente en el repositorio si el MAPA no puede leerse.
+- Disminuye el uso de memoria al no duplicar en la caché grandes PDFs ni imágenes renderizadas.
+- Mantiene los avisos de error, los datos verificados y la fecha de origen, sin desactivar SSL.
 
-```bash
-REQUESTS_CA_BUNDLE=/ruta/al/ca-bundle.pem
-```
+## Si aparece la pantalla «Oh no»
 
-Esto no debe ser un certificado arbitrario del servidor, ni se recomienda desactivar la comprobación TLS. Si la CA no está disponible en el entorno de despliegue, se conservará el último dato validado con advertencia de falta de actualización.
+La documentación oficial de Streamlit indica que también puede deberse a un **límite de recursos de Community Cloud**, un fallo en las dependencias o una excepción de Python. No es posible diagnosticarlo a partir de esa pantalla por sí sola.
 
-## Advertencias de interpretación
-- La fecha de la última **nota** y la de la última **consulta correcta** no son lo mismo.
-- Si un indicador procede de otra nota más antigua, se muestra su **fecha de origen**.
-- La cotización de mercado puede quedar pendiente aunque la sección MAPA funcione (y viceversa).
-- La aplicación no sustituye la revisión de los documentos oficiales enlazados.
+Abre la app estando identificado → `Manage app` (esquina inferior derecha) → `Cloud logs` y consulta las últimas líneas del error. Si no existe un traceback, revisa los límites de memoria y prueba un reinicio.
+
+Referencia: https://docs.streamlit.io/deploy/streamlit-community-cloud/manage-your-app
+
+## Límites
+
+Este código se ha comprobado sintácticamente y se ha ejecutado con una simulación de error de conexión y sin datos previos, pero **no se ha desplegado ni se ha probado con el certificado real del MAPA desde Streamlit Community Cloud**. La aplicación no garantiza que una fuente externa siempre esté disponible.

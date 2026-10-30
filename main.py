@@ -41,7 +41,8 @@ HEADERS = {
 }
 
 CACHE_TTL_SECONDS = 15 * 60  # Consulta cada 15 minutos; actualización manual disponible
-APP_VERSION = "3.1 · 30/10/2026 · recuperación y carga PDF"
+MAX_DOWNLOAD_NOTES = 8  # Reducir uso de memoria en Streamlit Community Cloud
+APP_VERSION = "3.2 · 30/10/2026 · inicio seguro y recuperación local"
 MAPA_NEWS_URL = (
     "https://www.mapa.gob.es/es/ganaderia/temas/"
     "sanidad-animal-higiene-ganadera/sanidad-animal"
@@ -149,8 +150,11 @@ def restore_snapshot(snapshot: dict) -> tuple[list[dict], list[dict]]:
     notes = [deserialize_dates(n) for n in snapshot["notes"]]
     parsed_notes = [deserialize_dates(n) for n in snapshot["parsed_notes"]]
     for n in parsed_notes:
-        cached = pdf_cache_path(n.get("pdf_url", ""))
-        n["pdf_bytes"] = cached.read_bytes() if cached.exists() else b""
+        cached = pdf_cache_path(n.get("pdf_url") or "")
+        try:
+            n["pdf_bytes"] = cached.read_bytes() if cached.exists() else b""
+        except OSError:
+            n["pdf_bytes"] = b""
     return notes, parsed_notes
 
 
@@ -341,7 +345,6 @@ def fetch_text(url: str) -> str:
     return response.text
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_bytes(url: str) -> bytes:
     cached = pdf_cache_path(url)
     if cached.exists():
@@ -461,7 +464,6 @@ def get_mapa_notes() -> tuple[list[dict[str, Any]], str]:
     raise RuntimeError("Las páginas oficiales no contienen enlaces a notas PDF identificables de PPA en Cataluña.")
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def extract_pdf_text(pdf_bytes: bytes, max_pages: int | None = None) -> str:
     with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
         page_count = doc.page_count if max_pages is None else min(doc.page_count, max_pages)
@@ -469,7 +471,6 @@ def extract_pdf_text(pdf_bytes: bytes, max_pages: int | None = None) -> str:
     return "\n".join(text_parts)
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def render_pdf_page(pdf_bytes: bytes, page_number: int, zoom: float = 1.7) -> Image.Image:
     with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
         page = doc.load_page(page_number)
@@ -590,7 +591,6 @@ def parse_note_content(pdf_bytes: bytes, pdf_url: str) -> dict[str, Any]:
     }
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def parse_note(pdf_url: str) -> dict[str, Any]:
     return parse_note_content(fetch_bytes(pdf_url), pdf_url)
 
@@ -627,7 +627,7 @@ def save_manual_note(pdf_bytes: bytes) -> tuple[bool, str]:
     by_date[record["report_date"]] = record
     parsed = sorted(by_date.values(), key=lambda r: r["report_date"], reverse=True)[:12]
     notes = [{"title": "Nota PPA Cataluña (PDF aportado por usuario)"
-              if r.get("pdf_url", "").startswith("manual://") else
+              if (r.get("pdf_url") or "").startswith("manual://") else
               "Nota PPA Cataluña (MAPA)",
               "url": r.get("pdf_url", ""), "report_date": r["report_date"]}
              for r in parsed]
@@ -644,6 +644,28 @@ def save_manual_note(pdf_bytes: bytes) -> tuple[bool, str]:
     return True, ("Nota oficial incorporada, fecha " +
                   record["report_date"].strftime("%d/%m/%Y") +
                   ". Si falla Internet, se usarán los datos de esta nota.")
+
+
+def recover_from_repository_pdf() -> tuple[bool, str]:
+    """Try a real PDF shipped with the GitHub repo as seed if MAPA is unreachable.
+
+    It is only accepted if the existing extractor verifies its contents, date
+    and PPA indicators. An old PDF is explicitly labelled as historical.
+    """
+    candidates = [
+        BASE_DIR / "Peste-Porcina-Africana-Situacion-Actual.pdf",
+        BASE_DIR / "Peste Porcina Africana Situacion Actual.pdf",
+        BASE_DIR / "Peste-Porcina-Africana-Situación-Actual.pdf",
+    ]
+    for path in candidates:
+        try:
+            if path.is_file() and path.stat().st_size <= 20_000_000:
+                ok, message = save_manual_note(path.read_bytes())
+                if ok:
+                    return True, f"Se ha recuperado el PDF incluido en GitHub: {path.name}. {message}"
+        except (OSError, ValueError, RuntimeError) as exc:
+            return False, f"No se pudo validar el PDF local: {exc}"
+    return False, "El PDF del repositorio no contiene una nota validable o no existe."
 
 
 def find_latest_general_note(parsed_notes: list[dict[str, Any]]) -> dict[str, Any]:
@@ -866,7 +888,7 @@ last_success_utc = None
 try:
     notes, source_checked_utc = get_mapa_notes()
     extraction_errors = []
-    for item in notes[:12]:
+    for item in notes[:MAX_DOWNLOAD_NOTES]:
         try:
             result = parse_note(item["url"])
             if result.get("report_date") is None:
@@ -889,10 +911,22 @@ try:
 except Exception as exc:
     mapa_error = str(exc)
     status = "SIN CONEXIÓN"
+    local_pdf_message = None
+    if not cached_snapshot:
+        # El archivo Peste-Porcina-Africana-Situacion-Actual.pdf ya está en
+        # el repositorio que muestra la captura del usuario.
+        recovered, local_pdf_message = recover_from_repository_pdf()
+        if recovered:
+            cached_snapshot = read_snapshot()
     if cached_snapshot:
-        notes, parsed_notes = restore_snapshot(cached_snapshot)
-        last_success_utc = cached_snapshot.get("last_success_utc")
-        status = "DATOS CONSERVADOS"
+        try:
+            notes, parsed_notes = restore_snapshot(cached_snapshot)
+            last_success_utc = cached_snapshot.get("last_success_utc")
+            status = "DATOS CONSERVADOS"
+        except (OSError, ValueError, KeyError, TypeError) as restore_exc:
+            notes, parsed_notes = [], []
+            status = "SIN DATOS PREVIOS"
+            mapa_error += f"; además falló la recuperación: {restore_exc}"
     else:
         notes, parsed_notes = [], []
         status = "SIN DATOS PREVIOS"
@@ -905,11 +939,16 @@ if status != "ACTUALIZADO":
             f"Se muestran los últimos datos disponibles, de fecha **{format_date_es(newest)}**. "
             "NO son cifras confirmadas hoy."
         )
+        if local_pdf_message:
+            st.warning("RECUPERACIÓN AUTOMÁTICA DEL PDF DEL REPOSITORIO. " + local_pdf_message + " Estas cifras pueden estar desactualizadas.")
         if last_success_utc:
-            st.caption(f"Última consulta con lectura correcta: {last_success_utc[:19].replace('T', ' ')} UTC")
+            st.caption(f"Última lectura guardada: {last_success_utc[:19].replace('T', ' ')} UTC; comprueba la fecha de cada dato epidemiológico.")
     else:
         st.error("⚠️ NO SE HA PODIDO ACTUALIZAR EL MAPA Y NO EXISTE UNA LECTURA ANTERIOR GUARDADA. "
-                 "No se muestran cifras epidemiológicas no verificadas. Puede restaurar un ZIP desde la barra lateral.")
+                 "No se muestran cifras epidemiológicas no verificadas. Importa una nota PDF desde la barra lateral.")
+        st.info("La aplicación ha arrancado correctamente, pero no tiene datos epidemiológicos válidos. "
+                "Comprueba el PDF del repositorio o usa el cargador lateral. "
+                "El error de conexión está disponible en 'Detalles del problema de actualización'.")
     if mapa_error:
         st.caption("Si es la primera ejecución y no hay datos previos, "
                    "importa el último PDF del MAPA desde la barra lateral. "
@@ -1037,7 +1076,7 @@ if display_note.get("municipalities"):
     st.write(", ".join(display_note["municipalities"]))
 
 with st.expander("Enlace y descarga de la última nota oficial"):
-    if latest_note.get("pdf_url", "").startswith("https://"):
+    if (latest_note.get("pdf_url") or "").startswith("https://"):
         st.link_button("Abrir PDF oficial MAPA", latest_note["pdf_url"])
     if latest_note.get("pdf_bytes"):
         st.download_button(
