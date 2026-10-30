@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import io
+import json
+import os
+import hashlib
+import zipfile
 import re
 import unicodedata
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import fitz  # PyMuPDF
 import pandas as pd
@@ -14,6 +18,13 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 from PIL import Image
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    st_autorefresh = None
 
 
 st.set_page_config(
@@ -29,7 +40,7 @@ HEADERS = {
     )
 }
 
-CACHE_TTL_SECONDS = 6 * 60 * 60
+CACHE_TTL_SECONDS = 15 * 60  # Consulta cada 15 minutos; actualización manual disponible
 MAPA_NEWS_URL = (
     "https://www.mapa.gob.es/es/ganaderia/temas/"
     "sanidad-animal-higiene-ganadera/sanidad-animal"
@@ -71,6 +82,128 @@ SPANISH_TENS = {
 }
 
 BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data_ppa"
+PDF_DIR = DATA_DIR / "pdf"
+SNAPSHOT_FILE = DATA_DIR / "ultima_lectura_verificada.json"
+MARKET_FILE = DATA_DIR / "ultimo_mercado_verificado.json"
+
+# Al desplegar en Streamlit Community Cloud el disco puede ser efímero.
+# Descargar una copia de seguridad ZIP permite restaurar las últimas lecturas.
+
+
+def save_json_atomic(path: Path, payload: dict) -> bool:
+    """Guarda sólo datos de fuentes verificadas. Fallos de disco no paran la app."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(path)
+        return True
+    except OSError:
+        return False
+
+
+def read_snapshot() -> dict | None:
+    try:
+        data = json.loads(SNAPSHOT_FILE.read_text(encoding="utf-8"))
+        if data.get("version") == 2 and isinstance(data.get("parsed_notes"), list) and data["parsed_notes"]:
+            return data
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    return None
+
+
+def deserialize_dates(record: dict, keys=("report_date", "previous_note_date")) -> dict:
+    result = dict(record)
+    for key in keys:
+        if isinstance(result.get(key), str):
+            try:
+                result[key] = date.fromisoformat(result[key])
+            except ValueError:
+                result[key] = None
+    return result
+
+
+def serialize_record(record: dict) -> dict:
+    return {key: value.isoformat() if isinstance(value, (date, datetime)) else value
+            for key, value in record.items() if key not in ("pdf_bytes", "full_text", "previous_comparable_note")}
+
+
+def store_verified_snapshot(notes: list[dict], parsed_notes: list[dict], source_checked_utc: str):
+    """Persistencia de la última lectura con cifras reales, sin inventar valores."""
+    if not parsed_notes or not any(
+        n.get(k) is not None for n in parsed_notes for k in ("total_foci", "total_positives", "negatives_total", "farms")
+    ):
+        return False
+    payload = {
+        "version": 2,
+        "last_success_utc": source_checked_utc,
+        "notes": [serialize_record(n) for n in notes[:12]],
+        "parsed_notes": [serialize_record(n) for n in parsed_notes[:12]],
+    }
+    return save_json_atomic(SNAPSHOT_FILE, payload)
+
+
+def restore_snapshot(snapshot: dict) -> tuple[list[dict], list[dict]]:
+    notes = [deserialize_dates(n) for n in snapshot["notes"]]
+    parsed_notes = [deserialize_dates(n) for n in snapshot["parsed_notes"]]
+    for n in parsed_notes:
+        cached = pdf_cache_path(n.get("pdf_url", ""))
+        n["pdf_bytes"] = cached.read_bytes() if cached.exists() else b""
+    return notes, parsed_notes
+
+
+def pdf_cache_path(url: str) -> Path:
+    return PDF_DIR / (hashlib.sha256(url.encode("utf-8")).hexdigest() + ".pdf")
+
+
+def backup_zip() -> bytes | None:
+    if not SNAPSHOT_FILE.exists():
+        return None
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(SNAPSHOT_FILE, "ultima_lectura_verificada.json")
+        if MARKET_FILE.exists():
+            z.write(MARKET_FILE, "ultimo_mercado_verificado.json")
+        if PDF_DIR.exists():
+            for entry in PDF_DIR.glob("*.pdf"):
+                if entry.stat().st_size <= 20_000_000:
+                    z.write(entry, f"pdf/{entry.name}")
+    return output.getvalue()
+
+
+def restore_backup_zip(content: bytes) -> bool:
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as z:
+            names = set(z.namelist())
+            if "ultima_lectura_verificada.json" not in names:
+                return False
+            raw = z.read("ultima_lectura_verificada.json")
+            snapshot = json.loads(raw)
+            if snapshot.get("version") != 2 or not snapshot.get("parsed_notes"):
+                return False
+            # No se extraen rutas arbitrarias; sólo PDFs con nombre SHA-256.
+            if not save_json_atomic(SNAPSHOT_FILE, snapshot):
+                return False
+            if "ultimo_mercado_verificado.json" in names:
+                try:
+                    market = json.loads(z.read("ultimo_mercado_verificado.json"))
+                    if market.get("version") == 1 and isinstance(market.get("snapshot"), dict):
+                        save_json_atomic(MARKET_FILE, market)
+                except (ValueError, TypeError):
+                    pass
+            PDF_DIR.mkdir(parents=True, exist_ok=True)
+            for name in names:
+                if re.fullmatch(r"pdf/[0-9a-f]{64}\.pdf", name):
+                    info = z.getinfo(name)
+                    if info.file_size <= 20_000_000:
+                        b = z.read(name)
+                        if b.startswith(b"%PDF-"):
+                            (PDF_DIR / Path(name).name).write_bytes(b)
+            return True
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile):
+        return False
+
 
 
 def normalize_text(value: str) -> str:
@@ -180,14 +313,28 @@ def extract_positive_counts(full_text: str) -> tuple[int | None, int | None]:
 
 
 def make_session() -> requests.Session:
+    """HTTPS verificado y reintentos. No se desactiva SSL en ningún caso."""
     session = requests.Session()
     session.headers.update(HEADERS)
+    retry = Retry(
+        total=2, connect=2, read=1, backoff_factor=0.8,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    # Para certificados de inspección corporativa, instalar su CA de confianza
+    # y configurar REQUESTS_CA_BUNDLE o SSL_CERT_FILE en el entorno.
+    bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("SSL_CERT_FILE")
+    if bundle and Path(bundle).is_file():
+        session.verify = bundle
     return session
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_text(url: str) -> str:
-    response = make_session().get(url, timeout=30)
+    response = make_session().get(url, timeout=(7, 12))
     response.raise_for_status()
     response.encoding = response.encoding or "utf-8"
     return response.text
@@ -195,9 +342,29 @@ def fetch_text(url: str) -> str:
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_bytes(url: str) -> bytes:
-    response = make_session().get(url, timeout=60)
-    response.raise_for_status()
-    return response.content
+    cached = pdf_cache_path(url)
+    if cached.exists():
+        data = cached.read_bytes()
+        if data.startswith(b"%PDF-"):
+            return data
+    try:
+        response = make_session().get(url, timeout=(7, 25))
+        response.raise_for_status()
+        data = response.content
+        if not data.startswith(b"%PDF-"):
+            raise ValueError("La dirección no devuelve un PDF válido.")
+        try:
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_bytes(data)
+        except OSError:
+            pass
+        return data
+    except Exception:
+        if cached.exists():
+            data = cached.read_bytes()
+            if data.startswith(b"%PDF-"):
+                return data
+        raise
 
 
 def load_local_image(filename: str) -> Image.Image | None:
@@ -231,7 +398,7 @@ def render_brand_header() -> None:
 
     logo_nutreco = load_local_image("Logo Nutreco.jpg")
     logo_techteam = load_local_image("Logo TechTeam 2.jpg")
-    ribbon = load_local_image("Solapa rosa.jpg")
+    ribbon = load_local_image("Solapa rosa trasparente.png") or load_local_image("Solapa rosa.jpg")
 
     left, right = st.columns([5, 1.4])
     with left:
@@ -255,26 +422,36 @@ def render_brand_header() -> None:
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def get_mapa_notes() -> list[dict[str, Any]]:
-    html = fetch_text(MAPA_NEWS_URL)
-    soup = BeautifulSoup(html, "html.parser")
-
+def get_mapa_notes() -> tuple[list[dict[str, Any]], str]:
+    """Prueba dos apartados oficiales; en caso de fallo la UI usa el snapshot."""
     records: dict[str, dict[str, Any]] = {}
-    for anchor in soup.find_all("a", href=True):
-        title = normalize_text(anchor.get_text(" ", strip=True))
-        if "Peste Porcina Africana" not in title or "Catalu" not in title:
-            continue
-
-        date_match = re.search(r"\((\d{2}[./]\d{2}[./]\d{4})\)", title)
-        report_date = parse_date_generic(date_match.group(1)) if date_match else None
-        href = urljoin(MAPA_NEWS_URL, anchor["href"])
-
-        if report_date is None or not href.lower().endswith(".pdf"):
-            continue
-
-        records[href] = {"title": title, "url": href, "report_date": report_date}
-
-    return sorted(records.values(), key=lambda row: row["report_date"], reverse=True)
+    errors = []
+    for landing in (MAPA_NEWS_URL, MAPA_DISEASE_URL):
+        try:
+            page_html = fetch_text(landing)
+            soup = BeautifulSoup(page_html, "html.parser")
+            for anchor in soup.find_all("a", href=True):
+                title = normalize_text(anchor.get_text(" ", strip=True))
+                normalized = strip_accents(title).lower()
+                if "peste porcina africana" not in normalized or "catalu" not in normalized:
+                    continue
+                date_match = re.search(r"\((\d{1,2}[./]\d{1,2}[./]\d{4})\)", title)
+                report_date = parse_date_generic(date_match.group(1)) if date_match else None
+                href = urljoin(landing, anchor["href"])
+                parsed = urlparse(href)
+                if parsed.scheme != "https" or not parsed.hostname or not parsed.hostname.endswith("mapa.gob.es"):
+                    continue
+                if not parsed.path.lower().endswith(".pdf") or report_date is None:
+                    continue
+                records[href] = {"title": title, "url": href, "report_date": report_date}
+        except Exception as exc:
+            errors.append(f"{landing}: {exc}")
+    if records:
+        return (sorted(records.values(), key=lambda n: n["report_date"], reverse=True),
+                datetime.now(timezone.utc).isoformat())
+    if errors:
+        raise RuntimeError("; ".join(errors))
+    raise RuntimeError("Las páginas oficiales no contienen enlaces a notas PDF identificables de PPA en Cataluña.")
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
@@ -416,12 +593,15 @@ def find_latest_general_note(parsed_notes: list[dict[str, Any]]) -> dict[str, An
 
 def merge_display_note(latest_note: dict[str, Any], latest_general_note: dict[str, Any], parsed_notes: list[dict[str, Any]]) -> dict[str, Any]:
     display = dict(latest_note)
+    source_dates = {}
     for field in (
         "total_foci", "primary_foci", "secondary_foci", "total_positives",
         "negatives_total", "negatives_captured", "negatives_passive", "farms",
         "municipalities", "zone", "domestic_status", "measures"
     ):
         value = display.get(field)
+        if value is not None and value != []:
+            source_dates[field] = display.get("report_date")
         if value is None or value == []:
             # Recuperación campo a campo: una nota puede contener focos pero omitir
             # otra cifra. No dependemos de que todos los datos estén en la misma nota.
@@ -429,7 +609,9 @@ def merge_display_note(latest_note: dict[str, Any], latest_general_note: dict[st
                 fallback_value = candidate.get(field)
                 if fallback_value is not None and fallback_value != []:
                     display[field] = fallback_value
+                    source_dates[field] = candidate.get("report_date")
                     break
+    display["_source_dates"] = source_dates
 
     previous_comparable = None
     for candidate in parsed_notes[1:]:
@@ -438,13 +620,13 @@ def merge_display_note(latest_note: dict[str, Any], latest_general_note: dict[st
             break
     display["previous_comparable_note"] = previous_comparable
 
-    if display.get("new_foci") is None and previous_comparable:
+    if display.get("new_foci") is None and previous_comparable and latest_note is latest_general_note:
         cur = display.get("total_foci")
         prev = previous_comparable.get("total_foci")
         if cur is not None and prev is not None:
             display["new_foci"] = cur - prev
 
-    if display.get("new_positives") is None and previous_comparable:
+    if display.get("new_positives") is None and previous_comparable and latest_note is latest_general_note:
         cur = display.get("total_positives")
         prev = previous_comparable.get("total_positives")
         if cur is not None and prev is not None:
@@ -463,35 +645,25 @@ def merge_display_note(latest_note: dict[str, Any], latest_general_note: dict[st
             if candidate.get("farms") not in (None, "", "N/D"):
                 display["farms"] = candidate["farms"]
                 break
-    if display.get("farms") in (None, "", "N/D"):
-        display["farms"] = 45
 
     return display
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def build_history(notes: list[dict[str, Any]], max_items: int = 12) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    for note in notes[:max_items]:
-        try:
-            stats = parse_note(note["url"])
-            rows.append(
-                {
-                    "Fecha": stats["report_date"],
-                    "Nuevos focos": stats["new_foci"],
-                    "Nuevos positivos": stats["new_positives"],
-                    "Focos totales": stats["total_foci"],
-                    "Positivos totales": stats["total_positives"],
-                    "Negativos analizados": stats["negatives_total"],
-                    "Explotaciones vigiladas": stats["farms"],
-                    "URL": note["url"],
-                }
-            )
-        except Exception:
-            continue
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values("Fecha").reset_index(drop=True)
+def build_history(parsed_notes: list[dict[str, Any]], max_items: int = 12) -> pd.DataFrame:
+    rows = []
+    for stats in parsed_notes[:max_items]:
+        rows.append({
+            "Fecha": stats.get("report_date"),
+            "Nuevos focos": stats.get("new_foci"),
+            "Nuevos positivos": stats.get("new_positives"),
+            "Focos totales": stats.get("total_foci"),
+            "Positivos totales": stats.get("total_positives"),
+            "Negativos analizados": stats.get("negatives_total"),
+            "Explotaciones vigiladas": stats.get("farms"),
+            "URL": stats.get("pdf_url", ""),
+        })
+    return (pd.DataFrame(rows).dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
+            if rows else pd.DataFrame())
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
@@ -574,13 +746,16 @@ def render_sources(latest_note: dict[str, Any], merco: dict[str, Any]) -> None:
         st.markdown(f"- [Cerdo cebado Mercolleida]({MERCOLLEIDA_CERDO_URL})")
         st.markdown(f"- [Cotizaciones 3tres3]({THREETHREE_PRICES_URL})")
         st.divider()
-        st.caption(f"Última nota MAPA cargada: {format_date_es(latest_note.get('report_date'))}")
+        st.caption(f"Última nota MAPA disponible: {format_date_es(latest_note.get('report_date'))}")
         if merco.get("home_date"):
             st.caption(f"Última fecha ganadero Mercolleida: {format_date_es(merco['home_date'])}")
-        st.caption("La app relee Internet en cada ejecución y cachea resultados 6 horas.")
+        st.caption("Consulta periódica cada 15 minutos (con app abierta). Última lectura correcta conservada localmente.")
 
 
 render_brand_header()
+
+if st_autorefresh is not None:
+    st_autorefresh(interval=15 * 60 * 1000, key="ppa_autorefresh")
 
 col_a, col_b = st.columns([1, 4])
 with col_a:
@@ -589,42 +764,136 @@ with col_a:
         st.rerun()
 with col_b:
     st.info(
-        "La app consulta las fuentes online cada vez que se abre. Si la última nota no trae cifras, mantiene el último consolidado epidemiológico válido."
+        "Consulta datos oficiales con conexión verificada. Si no puede actualizarlos, "
+        "muestra la última lectura correcta y su fecha. No inventa cifras."
     )
+
+# Se puede recuperar un ZIP guardado antes de un reinicio o despliegue.
+with st.sidebar:
+    st.markdown("### Copia de seguridad")
+    uploaded_backup = st.file_uploader("Restaurar última lectura (ZIP)", type=["zip"], key="backup_ppa")
+    if uploaded_backup and st.button("Restaurar datos verificados", key="restore_ppa"):
+        if restore_backup_zip(uploaded_backup.getvalue()):
+            st.success("Copia restaurada. Se recargará el panel.")
+            st.cache_data.clear()
+            st.rerun()
+        else:
+            st.error("No se ha podido validar o restaurar el ZIP.")
+
+cached_snapshot = read_snapshot()
+notes: list[dict[str, Any]] = []
+parsed_notes: list[dict[str, Any]] = []
+mapa_error = None
+status = "ACTUALIZADO"
+last_success_utc = None
 
 try:
-    notes = get_mapa_notes()
+    notes, source_checked_utc = get_mapa_notes()
+    extraction_errors = []
+    for item in notes[:12]:
+        try:
+            result = parse_note(item["url"])
+            if result.get("report_date") is None:
+                result["report_date"] = item.get("report_date")
+            parsed_notes.append(result)
+        except Exception as exc:
+            extraction_errors.append(f"{item['title']}: {exc}")
+    if not parsed_notes:
+        raise RuntimeError("No se pudo descargar o procesar ninguna nota oficial. " + "; ".join(extraction_errors[:2]))
+    if parsed_notes[0].get("pdf_url") != notes[0].get("url"):
+        status = "PARCIAL"
+        mapa_error = "No se pudo leer el PDF más reciente; se utiliza la última nota procesada. " + "; ".join(extraction_errors[:1])
+    if not any(n.get(k) is not None for n in parsed_notes for k in
+               ("total_foci", "total_positives", "negatives_total", "farms")):
+        raise RuntimeError("Los PDF descargados no contienen cifras epidemiológicas verificables.")
+    if status != "PARCIAL":
+        store_verified_snapshot(notes, parsed_notes, source_checked_utc)
+        cached_snapshot = read_snapshot()
+    last_success_utc = (cached_snapshot or {}).get("last_success_utc")
 except Exception as exc:
-    st.error(f"No se ha podido leer la página de noticias del MAPA: {exc}")
-    st.stop()
+    mapa_error = str(exc)
+    status = "SIN CONEXIÓN"
+    if cached_snapshot:
+        notes, parsed_notes = restore_snapshot(cached_snapshot)
+        last_success_utc = cached_snapshot.get("last_success_utc")
+        status = "DATOS CONSERVADOS"
+    else:
+        notes, parsed_notes = [], []
+        status = "SIN DATOS PREVIOS"
 
-if not notes:
-    st.error("No se han encontrado notas oficiales de PPA en Cataluña en la página del MAPA.")
-    st.stop()
+if status != "ACTUALIZADO":
+    if parsed_notes:
+        newest = parsed_notes[0].get("report_date")
+        st.error(
+            "⚠️ NO SE HA PODIDO ACTUALIZAR LA LECTURA DEL MAPA. "
+            f"Se muestran los últimos datos disponibles, de fecha **{format_date_es(newest)}**. "
+            "NO son cifras confirmadas hoy."
+        )
+        if last_success_utc:
+            st.caption(f"Última consulta con lectura correcta: {last_success_utc[:19].replace('T', ' ')} UTC")
+    else:
+        st.error("⚠️ NO SE HA PODIDO ACTUALIZAR EL MAPA Y NO EXISTE UNA LECTURA ANTERIOR GUARDADA. "
+                 "No se muestran cifras epidemiológicas no verificadas. Puede restaurar un ZIP desde la barra lateral.")
+    if mapa_error:
+        with st.expander("Detalles del problema de actualización"):
+            st.code(mapa_error)
+            if "CERTIFICATE_VERIFY_FAILED" in mapa_error or "SSLError" in mapa_error:
+                st.info("El certificado HTTPS no está validado por el servidor. Debe instalarse la CA raíz de confianza "
+                        "y configurarse REQUESTS_CA_BUNDLE en el entorno. No se desactiva SSL por seguridad.")
+else:
+    latest_date = parsed_notes[0].get("report_date")
+    st.success(f"Lectura oficial correcta. Última nota MAPA: {format_date_es(latest_date)}")
 
-parsed_notes: list[dict[str, Any]] = []
-for note in notes[:12]:
-    try:
-        parsed_notes.append(parse_note(note["url"]))
-    except Exception:
-        continue
+zip_bytes = backup_zip()
+if zip_bytes:
+    with st.sidebar:
+        st.download_button(
+            "Descargar copia de lectura verificada (ZIP)",
+            data=zip_bytes,
+            file_name="PPA_ultima_lectura_verificada.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
+        st.caption("Guarda este ZIP fuera de Streamlit Cloud: el almacenamiento del servidor puede reiniciarse.")
 
-if not parsed_notes:
-    st.error("No se ha podido procesar ninguna nota oficial del MAPA.")
-    st.stop()
+if parsed_notes:
+    latest_note = parsed_notes[0]
+    latest_general_note = find_latest_general_note(parsed_notes)
+    display_note = merge_display_note(latest_note, latest_general_note, parsed_notes)
+    previous_note = display_note.get("previous_comparable_note")
+else:
+    latest_note = {"report_date": None, "pdf_url": None, "pdf_bytes": b""}
+    latest_general_note = latest_note
+    display_note = latest_note
+    previous_note = None
 
-latest_note = parsed_notes[0]
-latest_general_note = find_latest_general_note(parsed_notes)
-display_note = merge_display_note(latest_note, latest_general_note, parsed_notes)
-previous_note = display_note.get("previous_comparable_note")
 merco = get_mercolleida_snapshot()
+market_stale = False
+if merco.get("price_value") is not None or merco.get("home_date") is not None:
+    save_json_atomic(MARKET_FILE, {
+        "version": 1,
+        "last_success_utc": datetime.now(timezone.utc).isoformat(),
+        "snapshot": serialize_record(merco),
+    })
+else:
+    try:
+        last_market = json.loads(MARKET_FILE.read_text(encoding="utf-8"))
+        if last_market.get("version") == 1:
+            merco = deserialize_dates(last_market["snapshot"], keys=("home_date", "detail_date", "comment_date"))
+            market_stale = True
+            st.warning("No se han podido consultar las fuentes de mercado. "
+                       "Se muestra la última cotización conservada (ver fecha de la fuente). "
+                       f"Última lectura correcta: {last_market.get('last_success_utc', 'N/D')[:19].replace('T', ' ')} UTC.")
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
 render_sources(display_note, merco)
 
-if latest_note.get("report_date") != latest_general_note.get("report_date"):
+if parsed_notes and latest_note.get("report_date") != latest_general_note.get("report_date"):
     st.warning(
-        f"La última nota publicada ({format_date_es(latest_note.get('report_date'))}) no aporta cifras generales suficientes. "
-        f"Se mantienen los últimos datos epidemiológicos consolidados de la nota del {format_date_es(latest_general_note.get('report_date'))}."
+        f"La última nota disponible ({format_date_es(latest_note.get('report_date'))}) no aporta cifras generales suficientes. "
+        f"Se mantienen las últimas cifras epidemiológicas consolidadas de la nota del {format_date_es(latest_general_note.get('report_date'))}."
     )
+
 
 st.subheader("Resumen ejecutivo")
 st.markdown(
@@ -632,6 +901,8 @@ st.markdown(
     f"**Última nota con cifras generales:** {format_date_es(latest_general_note.get('report_date'))}\n\n"
     f"**Ámbito principal:** {display_note.get('zone') or 'Revisar nota'}\n\n"
     f"**Estado en porcino doméstico:** {display_note.get('domestic_status') or 'Revisar nota oficial'}"
+    + (f" (según nota del {format_date_es(display_note.get('_source_dates', {}).get('domestic_status'))})"
+       if display_note.get('_source_dates', {}).get('domestic_status') else "")
 )
 
 m1, m2, m3, m4 = st.columns(4)
@@ -656,7 +927,17 @@ m5, m6, m7, m8 = st.columns(4)
 m5.metric("Negativos analizados", f"{display_note['negatives_total']:,}".replace(",", ".") if display_note.get("negatives_total") is not None else "N/D")
 m6.metric("Negativos capturados/abatidos", f"{display_note['negatives_captured']:,}".replace(",", ".") if display_note.get("negatives_captured") is not None else "N/D")
 m7.metric("Negativos vigilancia pasiva", f"{display_note['negatives_passive']:,}".replace(",", ".") if display_note.get("negatives_passive") is not None else "N/D")
-m8.metric("Explotaciones vigiladas", str(display_note.get("farms") if display_note.get("farms") not in (None, "", "N/D") else 45))
+m8.metric("Explotaciones vigiladas", str(display_note.get("farms")) if display_note.get("farms") is not None else "N/D")
+source_dates = display_note.get("_source_dates", {})
+if source_dates:
+    details = []
+    for title, field in (("Focos", "total_foci"), ("Positivos", "total_positives"),
+                         ("Negativos", "negatives_total"), ("Explotaciones vigiladas", "farms"),
+                         ("Porcino doméstico", "domestic_status")):
+        if source_dates.get(field):
+            details.append(f"{title}: {format_date_es(source_dates[field])}")
+    if details:
+        st.caption("Fecha de la fuente de cada indicador — " + " · ".join(details))
 
 missing_positive_fields = [
     label for label, field in (
@@ -676,13 +957,17 @@ if display_note.get("municipalities"):
     st.write(", ".join(display_note["municipalities"]))
 
 with st.expander("Enlace y descarga de la última nota oficial"):
-    st.link_button("Abrir PDF oficial MAPA", latest_note["pdf_url"])
-    st.download_button(
-        "Descargar última nota MAPA",
-        data=latest_note["pdf_bytes"],
-        file_name=f"PPA_MAPA_{format_date_es(latest_note.get('report_date')).replace('/', '')}.pdf",
-        mime="application/pdf",
-    )
+    if latest_note.get("pdf_url"):
+        st.link_button("Abrir PDF oficial MAPA", latest_note["pdf_url"])
+    if latest_note.get("pdf_bytes"):
+        st.download_button(
+            "Descargar última nota MAPA",
+            data=latest_note["pdf_bytes"],
+            file_name=f"PPA_MAPA_{format_date_es(latest_note.get('report_date')).replace('/', '')}.pdf",
+            mime="application/pdf",
+        )
+    elif not latest_note.get("pdf_url"):
+        st.info("Todavía no se dispone de una nota PDF descargable.")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📍 Cifras y lectura", "🗺️ Mapas", "🛡️ Medidas", "📈 Evolución", "💶 Mercado"])
 
@@ -699,7 +984,8 @@ with tab1:
         bullets.append(f"Los hallazgos reportados se mantienen en {display_note['zone']}.")
     if display_note.get("domestic_status"):
         bullets.append(f"Situación en cerdo doméstico: {display_note['domestic_status'].lower()}.")
-    bullets.append(f"Explotaciones vigiladas mostradas en panel: {display_note.get('farms')}.")
+    if display_note.get("farms") is not None:
+        bullets.append(f"Explotaciones vigiladas mostradas en panel: {display_note['farms']}.")
     for item in bullets:
         st.markdown(f"- {item}")
 
@@ -728,7 +1014,7 @@ with tab3:
 
 with tab4:
     st.write("### Evolución de las últimas notas oficiales")
-    history_df = build_history(notes, max_items=12)
+    history_df = build_history(parsed_notes, max_items=12)
     if history_df.empty:
         st.warning("No se ha podido construir el histórico automático.")
     else:
@@ -763,4 +1049,4 @@ with tab5:
     st.link_button("Abrir mercado cerdo cebado Mercolleida", MERCOLLEIDA_CERDO_URL)
 
 st.divider()
-st.caption("Si la nota más reciente no trae cifras, el panel conserva el último consolidado válido. El dato de explotaciones vigiladas queda blindado con respaldo final.")
+st.caption("Los datos provienen exclusivamente de notas oficiales verificables. Si falla la actualización, se visualiza el último dato guardado con aviso y fecha. N/D significa no disponible, nunca cero.")
