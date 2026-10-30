@@ -41,6 +41,7 @@ HEADERS = {
 }
 
 CACHE_TTL_SECONDS = 15 * 60  # Consulta cada 15 minutos; actualización manual disponible
+APP_VERSION = "3.1 · 30/10/2026 · recuperación y carga PDF"
 MAPA_NEWS_URL = (
     "https://www.mapa.gob.es/es/ganaderia/temas/"
     "sanidad-animal-higiene-ganadera/sanidad-animal"
@@ -419,6 +420,7 @@ def render_brand_header() -> None:
     if ribbon is not None:
         st.image(ribbon, use_container_width=True)
     st.caption("Panel corporativo Nutreco · actualización automática desde fuentes oficiales y mercado.")
+    st.caption(f"**VERSIÓN {APP_VERSION}** · Si esta identificación no aparece en pantalla, GitHub/Streamlit está ejecutando otro archivo o una versión anterior.")
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
@@ -426,7 +428,7 @@ def get_mapa_notes() -> tuple[list[dict[str, Any]], str]:
     """Prueba dos apartados oficiales; en caso de fallo la UI usa el snapshot."""
     records: dict[str, dict[str, Any]] = {}
     errors = []
-    for landing in (MAPA_NEWS_URL, MAPA_DISEASE_URL):
+    for landing in (MAPA_DISEASE_URL, MAPA_NEWS_URL):
         try:
             page_html = fetch_text(landing)
             soup = BeautifulSoup(page_html, "html.parser")
@@ -446,6 +448,11 @@ def get_mapa_notes() -> tuple[list[dict[str, Any]], str]:
                 records[href] = {"title": title, "url": href, "report_date": report_date}
         except Exception as exc:
             errors.append(f"{landing}: {exc}")
+            # Ambos destinos del MAPA comparten dominio/certificado. Repetir la
+            # conexión en caso de error de confianza TLS no solucionaría nada.
+            if any(tag in str(exc) for tag in
+                   ("CERTIFICATE_VERIFY_FAILED", "certificate verify failed", "SSLError")):
+                break
     if records:
         return (sorted(records.values(), key=lambda n: n["report_date"], reverse=True),
                 datetime.now(timezone.utc).isoformat())
@@ -515,9 +522,8 @@ def extract_farms(full_text: str) -> int | None:
     return None
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def parse_note(pdf_url: str) -> dict[str, Any]:
-    pdf_bytes = fetch_bytes(pdf_url)
+def parse_note_content(pdf_bytes: bytes, pdf_url: str) -> dict[str, Any]:
+    """Analiza un PDF oficial descargado o aportado por el usuario."""
     full_text = normalize_text(extract_pdf_text(pdf_bytes))
 
     note_date_match = re.search(r"(\d{2}/\d{2}/\d{4})", full_text)
@@ -582,6 +588,62 @@ def parse_note(pdf_url: str) -> dict[str, Any]:
         "domestic_status": domestic_status,
         "measures": extract_measures(full_text, farms),
     }
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def parse_note(pdf_url: str) -> dict[str, Any]:
+    return parse_note_content(fetch_bytes(pdf_url), pdf_url)
+
+
+def save_manual_note(pdf_bytes: bytes) -> tuple[bool, str]:
+    """Permite disponer de cifras oficiales verificables pese a fallo HTTPS.
+
+    No inventa indicadores: los extrae del texto del documento y se niega a
+    guardarlo si no reconoce el tema, fecha o cifras acumuladas.
+    """
+    if len(pdf_bytes) > 20_000_000 or not pdf_bytes.startswith(b"%PDF-"):
+        return False, "El archivo no es un PDF válido o supera 20 MB."
+    checksum = hashlib.sha256(pdf_bytes).hexdigest()
+    cache_id = "manual://" + checksum
+    try:
+        record = parse_note_content(pdf_bytes, cache_id)
+    except Exception as exc:
+        return False, f"No se pudo extraer texto del PDF: {exc}"
+
+    low = strip_accents(record.get("full_text", "").lower())
+    if "peste porcina africana" not in low or "catalu" not in low:
+        return False, "El archivo no parece ser una nota sobre PPA en Cataluña."
+    if record.get("report_date") is None:
+        return False, "No se pudo identificar una fecha verificable en la nota."
+    if not any(record.get(k) is not None for k in
+               ("total_foci", "total_positives", "negatives_total", "farms")):
+        return False, "No se identificaron cifras epidemiológicas en el PDF."
+
+    # Combinar con el histórico ya verificado (si existe), sin retroceder a
+    # un dato antiguo ni sustituir otras notas vigentes por un archivo viejo.
+    snapshot = read_snapshot()
+    old_parsed = restore_snapshot(snapshot)[1] if snapshot else []
+    by_date = {r.get("report_date"): r for r in old_parsed if r.get("report_date")}
+    by_date[record["report_date"]] = record
+    parsed = sorted(by_date.values(), key=lambda r: r["report_date"], reverse=True)[:12]
+    notes = [{"title": "Nota PPA Cataluña (PDF aportado por usuario)"
+              if r.get("pdf_url", "").startswith("manual://") else
+              "Nota PPA Cataluña (MAPA)",
+              "url": r.get("pdf_url", ""), "report_date": r["report_date"]}
+             for r in parsed]
+    try:
+        cached = pdf_cache_path(cache_id)
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        cached.write_bytes(pdf_bytes)
+    except OSError:
+        return False, "No se pudo conservar el PDF en disco."
+
+    ok = store_verified_snapshot(notes, parsed, datetime.now(timezone.utc).isoformat())
+    if not ok:
+        return False, "No se pudo guardar el histórico verificado."
+    return True, ("Nota oficial incorporada, fecha " +
+                  record["report_date"].strftime("%d/%m/%Y") +
+                  ". Si falla Internet, se usarán los datos de esta nota.")
 
 
 def find_latest_general_note(parsed_notes: list[dict[str, Any]]) -> dict[str, Any]:
@@ -770,6 +832,20 @@ with col_b:
 
 # Se puede recuperar un ZIP guardado antes de un reinicio o despliegue.
 with st.sidebar:
+    st.markdown("### Recuperación si falla el MAPA")
+    st.caption("Carga aquí la última nota PDF oficial del MAPA. Sus cifras "
+               "y mapas se conservarán y se mostrarán si vuelve a fallar la conexión.")
+    st.markdown(f"[Descargar notas oficiales de PPA — MAPA]({MAPA_DISEASE_URL})")
+    uploaded_note = st.file_uploader("Importar nota oficial (PDF)", type=["pdf"], key="nota_ppa_manual")
+    if uploaded_note is not None and st.button("Guardar lectura PDF", key="import_ppa_pdf", use_container_width=True):
+        ok, message = save_manual_note(uploaded_note.getvalue())
+        if ok:
+            st.success(message)
+            st.cache_data.clear()
+            st.rerun()
+        else:
+            st.error(message)
+    st.divider()
     st.markdown("### Copia de seguridad")
     uploaded_backup = st.file_uploader("Restaurar última lectura (ZIP)", type=["zip"], key="backup_ppa")
     if uploaded_backup and st.button("Restaurar datos verificados", key="restore_ppa"):
@@ -835,6 +911,10 @@ if status != "ACTUALIZADO":
         st.error("⚠️ NO SE HA PODIDO ACTUALIZAR EL MAPA Y NO EXISTE UNA LECTURA ANTERIOR GUARDADA. "
                  "No se muestran cifras epidemiológicas no verificadas. Puede restaurar un ZIP desde la barra lateral.")
     if mapa_error:
+        st.caption("Si es la primera ejecución y no hay datos previos, "
+                   "importa el último PDF del MAPA desde la barra lateral. "
+                   "Streamlit Cloud puede eliminar archivos guardados al reiniciar; "
+                   "descarga y conserva el ZIP de respaldo.")
         with st.expander("Detalles del problema de actualización"):
             st.code(mapa_error)
             if "CERTIFICATE_VERIFY_FAILED" in mapa_error or "SSLError" in mapa_error:
@@ -957,7 +1037,7 @@ if display_note.get("municipalities"):
     st.write(", ".join(display_note["municipalities"]))
 
 with st.expander("Enlace y descarga de la última nota oficial"):
-    if latest_note.get("pdf_url"):
+    if latest_note.get("pdf_url", "").startswith("https://"):
         st.link_button("Abrir PDF oficial MAPA", latest_note["pdf_url"])
     if latest_note.get("pdf_bytes"):
         st.download_button(
@@ -966,7 +1046,7 @@ with st.expander("Enlace y descarga de la última nota oficial"):
             file_name=f"PPA_MAPA_{format_date_es(latest_note.get('report_date')).replace('/', '')}.pdf",
             mime="application/pdf",
         )
-    elif not latest_note.get("pdf_url"):
+    elif not latest_note.get("pdf_bytes"):
         st.info("Todavía no se dispone de una nota PDF descargable.")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📍 Cifras y lectura", "🗺️ Mapas", "🛡️ Medidas", "📈 Evolución", "💶 Mercado"])
@@ -991,7 +1071,10 @@ with tab1:
 
     st.write("### Últimas notas detectadas")
     for note in notes[:8]:
-        st.markdown(f"- [{note['report_date'].strftime('%d/%m/%Y')}]({note['url']}) — {note['title']}")
+        if str(note.get("url", "")).startswith("https://"):
+            st.markdown(f"- [{note['report_date'].strftime('%d/%m/%Y')}]({note['url']}) — {note['title']}")
+        else:
+            st.markdown(f"- {note['report_date'].strftime('%d/%m/%Y')} — {note['title']} (PDF guardado en la app)")
 
 with tab2:
     st.write("### Mapas oficiales de la última nota")
